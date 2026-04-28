@@ -554,7 +554,18 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         // v10: 使用 await + try-catch，防止 getStats 异常中断整个循环
         while (this.connected) {
             try {
-                if (this.stats) {
+                if (this.currentGlobalMode === 'pure_local') {
+                    // PureLocal 模式无视频流，绕过 webrtc-stats 直接上报浏览器侧指标
+                    if (this.signaler) {
+                        this.signaler.sendStats({
+                            rafFps: this._rafFps,
+                            // framesPerSecond 会被 mqtt-signaling 映射为 frameRateFps，
+                            // Unity 侧最终写入 CSV 的 clientFPS 列
+                            framesPerSecond: this._rafFps,
+                            statsSchemaVersion: 2,
+                        });
+                    }
+                } else if (this.stats) {
                     await this.stats.getStats({
                         latency: this.compositor.latency,
                         rafFps: this._rafFps,

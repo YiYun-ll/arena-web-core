@@ -143,24 +143,29 @@ export default class MQTTSignaling {
     }
 
     sendStats(stats) {
+        const safeStats = stats || {};
         const msg = {
             type: 'client_stats',
             source: 'client',
             id: this.id,
             data: {
-                packetLossPercent: Math.max(0, stats.smoothedLossPercent ?? stats.packetLossPercent ?? 0),
-                totalPacketLossPercent: Math.max(0, stats.totalPacketLossPercent ?? 0),
-                rawPacketLossPercent: Math.max(0, stats.packetLossPercent ?? 0),
-                nackDelta: Math.max(0, stats.nackDelta ?? 0),
-                jitterMs: stats.jitterMs || 0,
-                downlinkKbps: stats.bitrate || stats.bitrateKbps || 0,
-                frameRateFps: stats.framesPerSecond || 0,
-                packetsLost: stats.packetsLost || 0,
-                packetsReceived: stats.packetsReceived || 0,
-                roundTripTimeMs: stats.roundTripTime ? stats.roundTripTime * 1000 : 0,
-                statsIntervalMs: Math.max(0, stats.statsIntervalMs ?? 0),
-                deltaPacketsLost: Math.max(0, stats.deltaPacketsLost ?? 0),
-                deltaPacketsReceived: Math.max(0, stats.deltaPacketsReceived ?? 0),
+                // 全量透传 webrtc-stats.js 的所有字段（原生 + additionalStats）
+                ...safeStats,
+                // 以下覆写保证与 Unity ClientNetworkStats 的兼容映射
+                packetLossPercent: Math.max(0, safeStats.smoothedLossPercent ?? safeStats.packetLossPercent ?? 0),
+                rawPacketLossPercent: Math.max(0, safeStats.packetLossPercent ?? 0),
+                totalPacketLossPercent: Math.max(0, safeStats.totalPacketLossPercent ?? 0),
+                nackDelta: Math.max(0, safeStats.nackDelta ?? 0),
+                jitterMs: safeStats.jitterMs || 0,
+                downlinkKbps: safeStats.downlinkKbps || safeStats.bitrate || 0,
+                frameRateFps: safeStats.framesPerSecond || safeStats.frameRateFps || 0,
+                packetsLost: safeStats.packetsLost || 0,
+                packetsReceived: safeStats.packetsReceived || 0,
+                roundTripTimeMs: safeStats.roundTripTimeMs
+                    || (safeStats.roundTripTime ? safeStats.roundTripTime * 1000 : 0),
+                statsIntervalMs: Math.max(0, safeStats.statsIntervalMs ?? 0),
+                deltaPacketsLost: Math.max(0, safeStats.deltaPacketsLost ?? 0),
+                deltaPacketsReceived: Math.max(0, safeStats.deltaPacketsReceived ?? 0),
             },
             ts: new Date().getTime(),
         };
