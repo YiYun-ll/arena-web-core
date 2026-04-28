@@ -7,14 +7,31 @@ export default class WebRTCStatsLogger {
         this.logToConsole = logToConsole;
 
         this.lastReport = null;
+        this._lastPacketsLost = 0;
+        this._lastPacketsReceived = 0;
+        this._smoothedLoss = 0;
     }
 
     async getStats(additionalStats) {
-        const report = await this.peerConnection.getStats();
-        this.handleReport(report, additionalStats);
+        // v10: 增加空检查，防止 PC 被关闭后调用 getStats 抛异常
+        if (!this.peerConnection) {
+            return;
+        }
+        try {
+            const report = await this.peerConnection.getStats();
+            this.handleReport(report, additionalStats);
+        } catch (err) {
+            console.warn('[WebRTCStatsLogger] getStats failed:', err);
+        }
     }
 
     handleReport(report, additionalStats) {
+        const safeAdditionalStats = additionalStats || {};
+        // v10: 如果 signaler 已不可用（如重连期间），跳过本次上报
+        if (!this.signaler) {
+            return;
+        }
+
         report.forEach((stat) => {
             if (stat.type !== 'inbound-rtp') {
                 return;
@@ -82,7 +99,6 @@ export default class WebRTCStatsLogger {
                 }
 
                 if (this.lastReport && this.lastReport.has(stat.id)) {
-                    // calculate bitrate
                     const lastStats = this.lastReport.get(stat.id);
                     const duration = (stat.timestamp - lastStats.timestamp) / 1000;
                     const bitrate = (8 * (stat.bytesReceived - lastStats.bytesReceived)) / duration / 1000;
@@ -93,16 +109,78 @@ export default class WebRTCStatsLogger {
                 }
             }
 
-            Object.keys(additionalStats).forEach((key) => {
+            Object.keys(safeAdditionalStats).forEach((key) => {
                 // eslint-disable-next-line no-param-reassign
-                stat[key] = additionalStats[key];
+                stat[key] = safeAdditionalStats[key];
             });
 
             if (stat.latency) {
                 info(`E2E Latency: ${stat.latency} ms`);
             }
 
-            this.signaler.sendStats(stat); // TODO (elu2): causing some disconnects for renderfusion when heartbeats not high enough
+            const jitterMs = (stat.jitter !== undefined && stat.jitter !== null)
+                ? stat.jitter * 1000
+                : 0;
+
+            if (this.lastReport && this.lastReport.has(stat.id)) {
+                const lastStats = this.lastReport.get(stat.id);
+
+                const dLost = stat.packetsLost - lastStats.packetsLost;
+                const dRecv = stat.packetsReceived - lastStats.packetsReceived;
+                const effectiveLost = Math.max(0, dLost);
+                const dTotal = effectiveLost + Math.max(0, dRecv);
+
+                let packetLossPercent = 0;
+                if (dTotal > 0) {
+                    packetLossPercent = (effectiveLost / dTotal) * 100;
+                }
+                packetLossPercent = Math.min(100, packetLossPercent);
+
+                const totalPackets = (stat.packetsLost || 0) + (stat.packetsReceived || 0);
+                const totalPacketLossPercent = totalPackets > 0
+                    ? Math.min(100, ((stat.packetsLost || 0) / totalPackets) * 100)
+                    : 0;
+
+                this._smoothedLoss = 0.3 * packetLossPercent + 0.7 * this._smoothedLoss;
+                const smoothedLossPercent = Math.min(100, this._smoothedLoss);
+
+                const nackDelta = Math.max(0, (stat.nackCount || 0) - (lastStats.nackCount || 0));
+
+                const statsIntervalMs = stat.timestamp - lastStats.timestamp;
+                const deltaPacketsLost = effectiveLost;
+                const deltaPacketsReceived = Math.max(0, dRecv);
+
+                const computedStats = {
+                    ...stat,
+                    statsSchemaVersion: 2,
+                    downlinkKbps: stat.bitrate || 0,
+                    packetLossPercent,
+                    smoothedLossPercent,
+                    totalPacketLossPercent,
+                    nackDelta,
+                    jitterMs,
+                    statsIntervalMs,
+                    deltaPacketsLost,
+                    deltaPacketsReceived,
+                };
+
+                this.signaler.sendStats(computedStats);
+            } else {
+                this._smoothedLoss = 0;
+                this.signaler.sendStats({
+                    ...stat,
+                    statsSchemaVersion: 2,
+                    downlinkKbps: stat.bitrate || 0,
+                    packetLossPercent: 0,
+                    smoothedLossPercent: 0,
+                    totalPacketLossPercent: 0,
+                    nackDelta: 0,
+                    jitterMs,
+                    statsIntervalMs: 0,
+                    deltaPacketsLost: 0,
+                    deltaPacketsReceived: 0,
+                });
+            }
         });
 
         this.lastReport = report;

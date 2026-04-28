@@ -1,3 +1,15 @@
+# RenderFusion 浏览器源码快照
+
+以下为 `arena-web-core` 中 RenderFusion 相关两个文件的完整内容（便于归档与对照）。源路径：
+
+- `src/systems/renderfusion/render-client.js`
+- `src/components/renderfusion/remote-render.js`
+
+---
+
+## `render-client.js`
+
+```javascript
 import MQTTSignaling from './signaling/mqtt-signaling';
 import WebRTCStatsLogger from './webrtc-stats';
 import RenderFusionUtils from './utils';
@@ -35,8 +47,6 @@ const dataChannelOptions = {
 const supportsSetCodecPreferences =
     window.RTCRtpTransceiver && 'setCodecPreferences' in window.RTCRtpTransceiver.prototype;
 
-const MODE_MESSAGE_TIMEOUT_MS = 3000;
-
 /** a-entity ids that should not participate in remote-render toggling */
 const REMOTE_RENDER_SKIP_IDS = new Set(['env', 'my-camera', 'cameraRig', 'floor']);
 
@@ -63,7 +73,6 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         this.currentGlobalMode = null;
         this.renderDecisionsChannel = null;
         this._sceneMutationObserver = null;
-        this._modeMessageTimeoutId = null;
 
         ARENA.events.addMultiEventListener(
             [ARENA_EVENTS.ARENA_LOADED, ARENA_EVENTS.MQTT_LOADED],
@@ -76,12 +85,6 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         // Reuse to avoid allocation
         this.currPos = new THREE.Vector3();
         this.currRot = new THREE.Quaternion();
-
-        // v10: 连接世代计数器，防止旧连接的延迟回调中断新连接
-        this._connectionGen = 0;
-        this._rafFrameCount = 0;
-        this._rafLastSampleTime = performance.now();
-        this._rafFps = 0;
     },
 
     async ready() {
@@ -228,34 +231,15 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         // console.debug('got offer.');
 
         const _this = this;
-
-        // v10: 清理旧连接，防止旧 PC/DataChannel 的延迟回调与新连接竞态
-        if (this.pc) {
-            try {
-                this.pc.close();
-            } catch (e) {
-                // ignore
-            }
-            this.pc = null;
-        }
-        this.inputDataChannel = null;
-        this.statusDataChannel = null;
-        this.renderDecisionsChannel = null;
-
         this.pc = new RTCPeerConnection(pcConfig);
-        // v10: 递增连接世代，用于过滤旧连接的延迟事件回调
-        this._connectionGen++;
-        const myGen = this._connectionGen;
-
         this.pc.onicecandidate = this.onIceCandidate.bind(this);
         this.pc.ontrack = this.onRemoteTrack.bind(this);
         this.pc.oniceconnectionstatechange = () => {
-            if (!_this.pc) return;
-            // v10: 忽略非当前世代 PC 的事件
-            if (_this._connectionGen !== myGen) return;
-            // console.debug('iceConnectionState changed:', this.pc.iceConnectionState);
-            if (_this.pc.iceConnectionState === 'disconnected') {
-                _this.handleCloudDisconnect();
+            if (_this.pc) {
+                // console.debug('iceConnectionState changed:', this.pc.iceConnectionState);
+                if (_this.pc.iceConnectionState === 'disconnected') {
+                    _this.handleCloudDisconnect();
+                }
             }
         };
 
@@ -273,8 +257,6 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         };
         this.inputDataChannel.onclose = () => {
             // console.debug('input data channel closed');
-            // v10: 忽略旧世代 DataChannel 的关闭事件，防止中断新连接
-            if (_this._connectionGen !== myGen) return;
             _this.handleCloudDisconnect();
         };
 
@@ -284,8 +266,6 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         };
         this.statusDataChannel.onclose = () => {
             // console.debug('status data channel closed');
-            // v10: 忽略旧世代 DataChannel 的关闭事件，防止中断新连接
-            if (_this._connectionGen !== myGen) return;
             _this.handleCloudDisconnect();
         };
 
@@ -329,8 +309,9 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
             .setRemoteDescription(new RTCSessionDescription(answer))
             .then(() => {
                 this.connected = true;
-                this.currentGlobalMode = null;
-                this._scheduleModeMessageFallback();
+
+                const env = document.getElementById('env');
+                env.setAttribute('visible', false);
 
                 this.checkStats();
             })
@@ -365,11 +346,9 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
 
     gotIceCandidate(candidate) {
         // console.debug('got ice.');
-        // v10: 增加保护，避免在断开或重连期间处理迟到的 candidate
-        if (!this.connected || !this.pc) {
-            return;
+        if (this.connected) {
+            this.pc.addIceCandidate(new RTCIceCandidate(candidate));
         }
-        this.pc.addIceCandidate(new RTCIceCandidate(candidate));
     },
 
     gotHealthCheck() {
@@ -387,25 +366,8 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
             // Unity: 0 = Remote, 1 = Local
             this.applyPerObjectDecision(msg.objectId, msg.renderMode === 0);
         } else if (msg.type === 'render_mode') {
-            this._clearModeMessageFallback();
             this.applyGlobalRenderMode(msg.mode);
         }
-    },
-
-    _scheduleModeMessageFallback() {
-        this._clearModeMessageFallback();
-        this._modeMessageTimeoutId = window.setTimeout(() => {
-            this._modeMessageTimeoutId = null;
-            if (!this.connected || this.currentGlobalMode !== null) return;
-            warn(`No render_mode received within ${MODE_MESSAGE_TIMEOUT_MS}ms; falling back to pure_local.`);
-            this.applyGlobalRenderMode('pure_local');
-        }, MODE_MESSAGE_TIMEOUT_MS);
-    },
-
-    _clearModeMessageFallback() {
-        if (this._modeMessageTimeoutId === null) return;
-        window.clearTimeout(this._modeMessageTimeoutId);
-        this._modeMessageTimeoutId = null;
     },
 
     ensureCompositorPassEnabled() {
@@ -520,7 +482,6 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
 
         if (!this.connected) return;
 
-        this._clearModeMessageFallback();
         const env = document.getElementById('env');
         if (env) env.setAttribute('visible', true);
 
@@ -536,14 +497,6 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         this.connected = false;
         this.inputDataChannel = null;
         this.statusDataChannel = null;
-        // v10: 先关闭再置空，但保留 gotOffer 自行创建新 PC 的权责
-        if (this.pc) {
-            try {
-                this.pc.close();
-            } catch (e) {
-                // ignore
-            }
-        }
         this.pc = null;
         this.healthCounter = 0;
         this.connectToCloud();
@@ -551,18 +504,8 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
 
     async checkStats() {
         const { data } = this;
-        // v10: 使用 await + try-catch，防止 getStats 异常中断整个循环
         while (this.connected) {
-            try {
-                if (this.stats) {
-                    await this.stats.getStats({
-                        latency: this.compositor.latency,
-                        rafFps: this._rafFps,
-                    });
-                }
-            } catch (err) {
-                console.warn('[checkStats] stats error:', err);
-            }
+            this.stats.getStats({ latency: this.compositor.latency });
             // eslint-disable-next-line no-await-in-loop
             await this.sleep(data.getStatsInterval);
         }
@@ -636,13 +579,6 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
 
     tick(t) {
         if (!this.isReady) return;
-        this._rafFrameCount += 1;
-        const now = performance.now();
-        if (now - this._rafLastSampleTime >= 1000) {
-            this._rafFps = (this._rafFrameCount * 1000) / (now - this._rafLastSampleTime);
-            this._rafFrameCount = 0;
-            this._rafLastSampleTime = now;
-        }
         const { data, el } = this;
 
         const { sceneEl } = el;
@@ -696,3 +632,104 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         }
     },
 });
+```
+
+---
+
+## `remote-render.js`
+
+```javascript
+AFRAME.registerComponent('remote-render', {
+    schema: {
+        enabled: { type: 'boolean', default: false },
+        printObjectStats: { type: 'boolean', default: true },
+    },
+
+    init() {
+        const { data, el } = this;
+        if (!el) return;
+
+        this.getObjectStats = this.getObjectStats.bind(this);
+
+        if (data.printObjectStats) {
+            if (el.hasAttribute('gltf-model')) {
+                el.addEventListener('model-loaded', this.getObjectStats, { once: true });
+            } else {
+                this.getObjectStats();
+            }
+        }
+    },
+
+    clipCornersToViewport(corners) {
+        const clippedCorners = [];
+
+        corners.forEach((corner) => {
+            const clippedCorner = new THREE.Vector3(
+                Math.min(Math.max(corner.x, -1), 1),
+                Math.min(Math.max(corner.y, -1), 1),
+                corner.z
+            );
+            clippedCorners.push(clippedCorner);
+        });
+
+        return clippedCorners;
+    },
+
+    solidAngleSubtendedByBoundingBox(cameraPosition, center, dimensions) {
+        const width = dimensions.x;
+        const height = dimensions.y;
+        const depth = dimensions.z;
+
+        const diagonalLength = Math.sqrt(width * width + height * height + depth * depth) / 2;
+        const A = Math.PI * diagonalLength ** 2;
+
+        const r = cameraPosition.distanceTo(center);
+
+        const solidAngle = A / r ** 2;
+
+        return solidAngle;
+    },
+
+    getObjectStats() {
+        const { el } = this;
+        if (!el?.sceneEl) return;
+        const { sceneEl } = el;
+
+        const { camera } = sceneEl;
+
+        const object = el.getObject3D('mesh');
+        if (object === undefined) return;
+
+        let triangleCount = 0;
+        object.traverse((node) => {
+            if (node.isMesh) {
+                triangleCount += node.geometry.attributes.position.count / 3;
+            }
+        });
+
+        // console.log('Triangle count:', el.id, triangleCount);
+
+        const box = new THREE.Box3().setFromObject(el.object3D);
+
+        const center = new THREE.Vector3();
+        box.getCenter(center);
+
+        const dimensions = new THREE.Vector3();
+        box.getSize(dimensions);
+
+        // const box1 = new THREE.BoxHelper(el.object3D, 0xffff00);
+        // sceneEl.object3D.add(box1);
+
+        const cameraPosition = camera.position;
+        const solidAngle = this.solidAngleSubtendedByBoundingBox(cameraPosition, center, dimensions);
+
+        // console.log('Total solid angle:', el.id, solidAngle);
+    },
+
+    update() {
+        // console.log('[render-client]', this.el.id, this.data.enabled);
+        if (!this.el) return;
+        this.el.setAttribute('visible', !this.data.enabled);
+    },
+});
+```

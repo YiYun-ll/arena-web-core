@@ -6,12 +6,13 @@ AFRAME.registerComponent('remote-render', {
 
     init() {
         const { data, el } = this;
+        if (!el) return;
 
         this.getObjectStats = this.getObjectStats.bind(this);
 
         if (data.printObjectStats) {
             if (el.hasAttribute('gltf-model')) {
-                el.addEventListener('model-loaded', this.getObjectStats);
+                el.addEventListener('model-loaded', this.getObjectStats, { once: true });
             } else {
                 this.getObjectStats();
             }
@@ -50,6 +51,7 @@ AFRAME.registerComponent('remote-render', {
 
     getObjectStats() {
         const { el } = this;
+        if (!el?.sceneEl) return;
         const { sceneEl } = el;
 
         const { camera } = sceneEl;
@@ -85,7 +87,7 @@ AFRAME.registerComponent('remote-render', {
 
     update() {
         // console.log('[render-client]', this.el.id, this.data.enabled);
-
+        if (!this.el) return;
         this.el.setAttribute('visible', !this.data.enabled);
     },
 });

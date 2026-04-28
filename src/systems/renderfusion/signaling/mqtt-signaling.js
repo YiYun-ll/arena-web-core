@@ -35,7 +35,6 @@ export default class MQTTSignaling {
                 userName: this.mqttUsername,
                 password: this.mqttToken,
                 onSuccess: () => {
-                    // TODO (elu2): fixme, this is called once per second after first server connection
                     _this.mqttOnConnect();
                     resolve();
                 },
@@ -75,15 +74,12 @@ export default class MQTTSignaling {
 
     mqttOnMessageArrived(message) {
         const signal = JSON.parse(message.payloadString);
-        // ignore other clients
         if (signal.source === 'client') return;
 
-        // ignore own messages
         if (signal.id === this.id) return;
 
         if (this.connectionId != null && signal.id !== this.connectionId) return;
 
-        // console.log('[render-client]', signal);
         if (signal.type === 'connect') {
             if (this.onConnect) this.onConnect();
         } else if (signal.type === 'offer') {
@@ -147,6 +143,27 @@ export default class MQTTSignaling {
     }
 
     sendStats(stats) {
-        this.publish(this.pubRenderClientPrivateTopic, JSON.stringify(stats));
+        const msg = {
+            type: 'client_stats',
+            source: 'client',
+            id: this.id,
+            data: {
+                packetLossPercent: Math.max(0, stats.smoothedLossPercent ?? stats.packetLossPercent ?? 0),
+                totalPacketLossPercent: Math.max(0, stats.totalPacketLossPercent ?? 0),
+                rawPacketLossPercent: Math.max(0, stats.packetLossPercent ?? 0),
+                nackDelta: Math.max(0, stats.nackDelta ?? 0),
+                jitterMs: stats.jitterMs || 0,
+                downlinkKbps: stats.bitrate || stats.bitrateKbps || 0,
+                frameRateFps: stats.framesPerSecond || 0,
+                packetsLost: stats.packetsLost || 0,
+                packetsReceived: stats.packetsReceived || 0,
+                roundTripTimeMs: stats.roundTripTime ? stats.roundTripTime * 1000 : 0,
+                statsIntervalMs: Math.max(0, stats.statsIntervalMs ?? 0),
+                deltaPacketsLost: Math.max(0, stats.deltaPacketsLost ?? 0),
+                deltaPacketsReceived: Math.max(0, stats.deltaPacketsReceived ?? 0),
+            },
+            ts: new Date().getTime(),
+        };
+        this.publish(this.pubRenderClientPrivateTopic, JSON.stringify(msg));
     }
 }
