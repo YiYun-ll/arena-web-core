@@ -152,6 +152,9 @@ export default class MQTTSignaling {
                 // 全量透传 webrtc-stats.js 的所有字段（原生 + additionalStats）
                 ...safeStats,
                 // 以下覆写保证与 Unity ClientNetworkStats 的兼容映射
+                statsSource: safeStats.statsSource || 'unknown',
+                currentGlobalMode: safeStats.currentGlobalMode || 'unknown',
+                statsFallback: Boolean(safeStats.statsFallback || safeStats._statsFallback),
                 packetLossPercent: Math.max(0, safeStats.smoothedLossPercent ?? safeStats.packetLossPercent ?? 0),
                 rawPacketLossPercent: Math.max(0, safeStats.packetLossPercent ?? 0),
                 totalPacketLossPercent: Math.max(0, safeStats.totalPacketLossPercent ?? 0),

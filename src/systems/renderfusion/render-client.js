@@ -35,7 +35,7 @@ const dataChannelOptions = {
 const supportsSetCodecPreferences =
     window.RTCRtpTransceiver && 'setCodecPreferences' in window.RTCRtpTransceiver.prototype;
 
-const MODE_MESSAGE_TIMEOUT_MS = 3000;
+const MODE_MESSAGE_TIMEOUT_MS = 10000;
 
 /** a-entity ids that should not participate in remote-render toggling */
 const REMOTE_RENDER_SKIP_IDS = new Set(['env', 'my-camera', 'cameraRig', 'floor']);
@@ -60,7 +60,9 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
     async init() {
         this.isReady = false;
         this.pendingDecisions = {};
+        this.renderDecisionStates = {};
         this.currentGlobalMode = null;
+        this.statsGlobalMode = 'unknown';
         this.renderDecisionsChannel = null;
         this._sceneMutationObserver = null;
         this._modeMessageTimeoutId = null;
@@ -81,7 +83,14 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         this._connectionGen = 0;
         this._rafFrameCount = 0;
         this._rafLastSampleTime = performance.now();
+        this._rafLastFrameTime = 0;
         this._rafFps = 0;
+        this._rafFrameDeltaMsSum = 0;
+        this._rafFrameDeltaMsMax = 0;
+        this._rafFrameDeltaCount = 0;
+        this._rafLongFrameCount = 0;
+        this._statsLoopRunning = false;
+        this._renderDecisionDecodeErrorCount = 0;
     },
 
     async ready() {
@@ -139,6 +148,7 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         info('Got remote stream! Hybrid Rendering session started.');
 
         this.setupTransceiver(evt.transceiver);
+        this._markHybridConnected('remote-track');
 
         const stream = new MediaStream();
         stream.addTrack(evt.track);
@@ -241,6 +251,11 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         this.inputDataChannel = null;
         this.statusDataChannel = null;
         this.renderDecisionsChannel = null;
+        this.currentGlobalMode = null;
+        this.statsGlobalMode = 'unknown';
+        this._renderDecisionDecodeErrorCount = 0;
+        this.renderDecisionStates = {};
+        this.pendingDecisions = {};
 
         this.pc = new RTCPeerConnection(pcConfig);
         // v10: 递增连接世代，用于过滤旧连接的延迟事件回调
@@ -263,13 +278,23 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         this.pc.ondatachannel = (evt) => {
             if (evt.channel.label === 'render-decisions') {
                 this.renderDecisionsChannel = evt.channel;
+                this.renderDecisionsChannel.binaryType = 'arraybuffer';
                 this.renderDecisionsChannel.onmessage = (m) => this.onRenderDecisionMessage(m);
+                this.renderDecisionsChannel.onopen = () => {
+                    this._markHybridConnected('render-decisions-channel');
+                    this._scheduleModeMessageFallback();
+                };
+                if (this.renderDecisionsChannel.readyState === 'open') {
+                    this._markHybridConnected('render-decisions-channel');
+                    this._scheduleModeMessageFallback();
+                }
             }
         };
 
         this.inputDataChannel = this.pc.createDataChannel('client-input', dataChannelOptions);
         this.inputDataChannel.onopen = () => {
             // console.debug('input data channel opened');
+            this._markHybridConnected('input-channel');
         };
         this.inputDataChannel.onclose = () => {
             // console.debug('input data channel closed');
@@ -281,6 +306,8 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         this.statusDataChannel = this.pc.createDataChannel('client-status', dataChannelOptions);
         this.statusDataChannel.onopen = () => {
             // console.debug('status data channel opened');
+            this._markHybridConnected('status-channel');
+            this.sendStatus();
         };
         this.statusDataChannel.onclose = () => {
             // console.debug('status data channel closed');
@@ -328,11 +355,7 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         this.pc
             .setRemoteDescription(new RTCSessionDescription(answer))
             .then(() => {
-                this.connected = true;
-                this.currentGlobalMode = null;
-                this._scheduleModeMessageFallback();
-
-                this.checkStats();
+                this._markHybridConnected('answer');
             })
             .catch((err) => {
                 console.error(err);
@@ -345,9 +368,10 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         this.pc
             .createAnswer()
             .then((description) => {
-                this.pc.setLocalDescription(description).then(() => {
+                return this.pc.setLocalDescription(description).then(() => {
                     // console.debug('sending answer');
                     this.signaler.sendAnswer(this.pc.localDescription);
+                    this._markHybridConnected('local-answer');
                     this.createOffer();
                 });
             })
@@ -365,22 +389,56 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
 
     gotIceCandidate(candidate) {
         // console.debug('got ice.');
-        // v10: 增加保护，避免在断开或重连期间处理迟到的 candidate
-        if (!this.connected || !this.pc) {
+        // v10: answerer 路径在 connected=true 前也会收到合法 ICE candidate，
+        // 只要当前 PeerConnection 存在就允许添加。
+        if (!this.pc) {
             return;
         }
         this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+    },
+
+    _markHybridConnected(reason) {
+        if (!this.connected) {
+            info(`Hybrid Rendering connected via ${reason}.`);
+            this.connected = true;
+            if (this.currentGlobalMode === null) {
+                this._scheduleModeMessageFallback();
+            }
+        }
+
+        if (!this._statsLoopRunning) {
+            this.checkStats();
+        }
     },
 
     gotHealthCheck() {
         this.signaler.sendHealthCheckAck();
     },
 
-    onRenderDecisionMessage(ev) {
+    async _decodeDataChannelPayload(data) {
+        if (typeof data === 'string') return data;
+        if (data instanceof ArrayBuffer) {
+            return new TextDecoder('utf-8').decode(data);
+        }
+        if (ArrayBuffer.isView(data)) {
+            return new TextDecoder('utf-8').decode(data);
+        }
+        if (typeof Blob !== 'undefined' && data instanceof Blob) {
+            return data.text();
+        }
+        return `${data}`;
+    },
+
+    async onRenderDecisionMessage(ev) {
         let msg;
         try {
-            msg = JSON.parse(ev.data);
-        } catch {
+            const payload = await this._decodeDataChannelPayload(ev.data);
+            msg = JSON.parse(payload);
+        } catch (err) {
+            this._renderDecisionDecodeErrorCount += 1;
+            if (this._renderDecisionDecodeErrorCount <= 3) {
+                warn(`Failed to parse render decision message: ${err?.message || err}`);
+            }
             return;
         }
         if (msg.type === 'render_decision') {
@@ -389,6 +447,10 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         } else if (msg.type === 'render_mode') {
             this._clearModeMessageFallback();
             this.applyGlobalRenderMode(msg.mode);
+        } else if (msg.type === 'batch_render_decisions' && Array.isArray(msg.decisions)) {
+            msg.decisions.forEach((decision) => {
+                this.applyPerObjectDecision(decision.objectId, decision.renderMode === 0);
+            });
         }
     },
 
@@ -397,8 +459,8 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         this._modeMessageTimeoutId = window.setTimeout(() => {
             this._modeMessageTimeoutId = null;
             if (!this.connected || this.currentGlobalMode !== null) return;
-            warn(`No render_mode received within ${MODE_MESSAGE_TIMEOUT_MS}ms; falling back to pure_local.`);
-            this.applyGlobalRenderMode('pure_local');
+            warn(`No render_mode received within ${MODE_MESSAGE_TIMEOUT_MS}ms; keeping hybrid rendering in unknown mode.`);
+            this.statsGlobalMode = 'unknown';
         }, MODE_MESSAGE_TIMEOUT_MS);
     },
 
@@ -419,7 +481,10 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
     },
 
     applyGlobalRenderMode(mode) {
+        const previousMode = this.currentGlobalMode;
+        const modeChanged = previousMode !== mode;
         this.currentGlobalMode = mode;
+        this.statsGlobalMode = mode;
         const env = document.getElementById('env');
 
         if (mode === 'pure_local') {
@@ -435,11 +500,10 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
             // smart (or unknown): compositor on, env hidden like hybrid default; per-object decisions apply
             this.ensureCompositorPassEnabled();
             if (env) env.setAttribute('visible', false);
-            this.setAllArenaEntitiesRemoteRender(false);
-            const pendingSnapshot = { ...this.pendingDecisions };
-            Object.keys(pendingSnapshot).forEach((objectId) => {
-                this.applyPerObjectDecision(objectId, pendingSnapshot[objectId]);
-            });
+            if (modeChanged) {
+                this.setAllArenaEntitiesRemoteRender(false);
+            }
+            this.applyKnownRenderDecisions();
         }
     },
 
@@ -452,14 +516,91 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
 
     applyPerObjectDecision(objectId, isRemote) {
         if (shouldSkipRemoteRenderEntityId(objectId)) return;
+        this.renderDecisionStates[objectId] = isRemote;
         const entity = this.findArenaEntityByObjectId(objectId);
         if (entity && shouldSkipRemoteRenderEntityId(entity.id)) return;
         if (!entity) {
             this.pendingDecisions[objectId] = isRemote;
             return;
         }
-        entity.setAttribute('remote-render', 'enabled', isRemote);
+        this.setEntityRemoteRender(entity, isRemote);
         delete this.pendingDecisions[objectId];
+    },
+
+    applyKnownRenderDecisions() {
+        const decisionSnapshot = { ...this.renderDecisionStates, ...this.pendingDecisions };
+        Object.keys(decisionSnapshot).forEach((objectId) => {
+            const isRemote = decisionSnapshot[objectId];
+            const entity = this.findArenaEntityByObjectId(objectId);
+            if (!entity) {
+                this.pendingDecisions[objectId] = isRemote;
+                return;
+            }
+            if (shouldSkipRemoteRenderEntityId(entity.id)) return;
+            this.setEntityRemoteRender(entity, isRemote);
+            delete this.pendingDecisions[objectId];
+        });
+    },
+
+    setEntityRemoteRender(entityEl, enabled) {
+        const current = entityEl.components?.['remote-render']?.data?.enabled;
+        if (current === enabled) return;
+        entityEl.setAttribute('remote-render', 'enabled', enabled);
+    },
+
+    getBrowserRenderStats() {
+        const renderer = this.el?.sceneEl?.renderer;
+        const canvas = renderer?.domElement;
+        const canvasWidth = canvas?.width || 0;
+        const canvasHeight = canvas?.height || 0;
+        const rendererPixelRatio = renderer?.getPixelRatio ? renderer.getPixelRatio() : 0;
+        let browserRemoteEntityCount = 0;
+        let browserLocalEntityCount = 0;
+        let browserTotalEntityCount = 0;
+        this.el?.sceneEl?.querySelectorAll('a-entity[id]')?.forEach((entityEl) => {
+            if (shouldSkipRemoteRenderEntityId(entityEl.id)) return;
+            browserTotalEntityCount += 1;
+            const remoteEnabled = entityEl.components?.['remote-render']?.data?.enabled === true;
+            if (remoteEnabled) browserRemoteEntityCount += 1;
+            else browserLocalEntityCount += 1;
+        });
+        const rafStats = this.consumeRafBreakdownStats();
+        const compositorEnabled = this.compositor?.pass?.enabled ? 1 : 0;
+        const compositorLatency = Number.isFinite(this.compositor?.latency) ? this.compositor.latency : -1;
+        return {
+            browserActualLocalQuality: canvasWidth > 0 && canvasHeight > 0
+                ? `${canvasWidth}x${canvasHeight}@${rendererPixelRatio || 0}`
+                : 'unknown',
+            browserCanvasWidth: canvasWidth,
+            browserCanvasHeight: canvasHeight,
+            browserDevicePixelRatio: window.devicePixelRatio || 1,
+            browserRendererPixelRatio: rendererPixelRatio,
+            clientRafFrameAvgMs: rafStats.avgMs,
+            clientRafFrameMaxMs: rafStats.maxMs,
+            clientRafLongFrameCount: rafStats.longFrameCount,
+            browserRemoteEntityCount,
+            browserLocalEntityCount,
+            browserTotalEntityCount,
+            browserCompositorEnabled: compositorEnabled,
+            browserCompositorLatencyMs: compositorLatency,
+            browserVideoReadyState: this.remoteVideo?.readyState || 0,
+            browserVideoWidth: this.remoteVideo?.videoWidth || 0,
+            browserVideoHeight: this.remoteVideo?.videoHeight || 0,
+        };
+    },
+
+    consumeRafBreakdownStats() {
+        const count = this._rafFrameDeltaCount || 0;
+        const stats = {
+            avgMs: count > 0 ? this._rafFrameDeltaMsSum / count : 0,
+            maxMs: this._rafFrameDeltaMsMax || 0,
+            longFrameCount: this._rafLongFrameCount || 0,
+        };
+        this._rafFrameDeltaMsSum = 0;
+        this._rafFrameDeltaMsMax = 0;
+        this._rafFrameDeltaCount = 0;
+        this._rafLongFrameCount = 0;
+        return stats;
     },
 
     setAllArenaEntitiesRemoteRender(enabled) {
@@ -467,7 +608,7 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         if (!sceneEl) return;
         sceneEl.querySelectorAll('a-entity[id]').forEach((entityEl) => {
             if (shouldSkipRemoteRenderEntityId(entityEl.id)) return;
-            entityEl.setAttribute('remote-render', 'enabled', enabled);
+            this.setEntityRemoteRender(entityEl, enabled);
         });
     },
 
@@ -475,14 +616,21 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         if (!entityEl?.id || shouldSkipRemoteRenderEntityId(entityEl.id)) return;
         if (Object.prototype.hasOwnProperty.call(this.pendingDecisions, entityEl.id)) {
             const isRemote = this.pendingDecisions[entityEl.id];
-            entityEl.setAttribute('remote-render', 'enabled', isRemote);
+            this.renderDecisionStates[entityEl.id] = isRemote;
+            this.setEntityRemoteRender(entityEl, isRemote);
             delete this.pendingDecisions[entityEl.id];
             return;
         }
+        if (Object.prototype.hasOwnProperty.call(this.renderDecisionStates, entityEl.id)) {
+            this.setEntityRemoteRender(entityEl, this.renderDecisionStates[entityEl.id]);
+            return;
+        }
         if (this.currentGlobalMode === 'pure_local') {
-            entityEl.setAttribute('remote-render', 'enabled', false);
+            this.setEntityRemoteRender(entityEl, false);
         } else if (this.currentGlobalMode === 'pure_remote') {
-            entityEl.setAttribute('remote-render', 'enabled', true);
+            this.setEntityRemoteRender(entityEl, true);
+        } else if (this.currentGlobalMode === 'smart') {
+            this.setEntityRemoteRender(entityEl, false);
         }
     },
 
@@ -527,6 +675,7 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         this.setAllArenaEntitiesRemoteRender(false);
         this.pendingDecisions = {};
         this.currentGlobalMode = null;
+        this.statsGlobalMode = 'unknown';
         this.renderDecisionsChannel = null;
 
         // this.compositor.unbind();
@@ -550,32 +699,67 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
     },
 
     async checkStats() {
+        if (this._statsLoopRunning) return;
+        this._statsLoopRunning = true;
         const { data } = this;
         // v10: 使用 await + try-catch，防止 getStats 异常中断整个循环
-        while (this.connected) {
-            try {
-                if (this.currentGlobalMode === 'pure_local') {
-                    // PureLocal 模式无视频流，绕过 webrtc-stats 直接上报浏览器侧指标
-                    if (this.signaler) {
-                        this.signaler.sendStats({
+        try {
+            while (this.connected) {
+                try {
+                    const mode = this.statsGlobalMode || this.currentGlobalMode || 'unknown';
+                    const browserRenderStats = this.getBrowserRenderStats();
+                    if (this.currentGlobalMode === 'pure_local') {
+                        // PureLocal 模式无视频流，绕过 webrtc-stats 直接上报浏览器侧指标
+                        if (this.signaler) {
+                            this.signaler.sendStats({
+                                ...browserRenderStats,
+                                statsSource: 'pure_local',
+                                currentGlobalMode: mode,
+                                rafFps: this._rafFps,
+                                // framesPerSecond 会被 mqtt-signaling 映射为 frameRateFps，
+                                // Unity 侧最终写入 CSV 的 clientFPS 列
+                                framesPerSecond: this._rafFps,
+                                statsSchemaVersion: 2,
+                            });
+                        }
+                    } else if (this.stats) {
+                        const sent = await this.stats.getStats({
+                            ...browserRenderStats,
+                            latency: this.compositor.latency,
                             rafFps: this._rafFps,
-                            // framesPerSecond 会被 mqtt-signaling 映射为 frameRateFps，
-                            // Unity 侧最终写入 CSV 的 clientFPS 列
-                            framesPerSecond: this._rafFps,
-                            statsSchemaVersion: 2,
+                            currentGlobalMode: mode,
                         });
+                        if (!sent && this.signaler) {
+                            // 降级兜底：没有 inbound-rtp 时也必须上报 RAF 和诊断来源，
+                            // 否则 Unity 侧会认为 SmartDecision 完全没收到 client_stats。
+                            const last = this.stats._lastSentStats || this.stats._lastInboundStat || {};
+                            const framesPerSecond = last.framesPerSecond || this._rafFps || 0;
+                            this.signaler.sendStats({
+                                ...last,
+                                ...browserRenderStats,
+                                rafFps: this._rafFps,
+                                framesPerSecond,
+                                statsSchemaVersion: 2,
+                                statsSource: this.stats._lastInboundStat ? 'fallback' : 'no_inbound',
+                                currentGlobalMode: mode,
+                                decoderImplementation: last.decoderImplementation || '',
+                                frameWidth: last.frameWidth || 0,
+                                frameHeight: last.frameHeight || 0,
+                                mimeType: last.mimeType || '',
+                                codecId: last.codecId || '',
+                                statsFallback: true,
+                                _statsFallback: true,
+                            });
+                        }
                     }
-                } else if (this.stats) {
-                    await this.stats.getStats({
-                        latency: this.compositor.latency,
-                        rafFps: this._rafFps,
-                    });
+                } catch (err) {
+                    console.warn('[checkStats] stats error:', err);
                 }
-            } catch (err) {
-                console.warn('[checkStats] stats error:', err);
+                // eslint-disable-next-line no-await-in-loop
+                await this.sleep(data.getStatsInterval);
             }
-            // eslint-disable-next-line no-await-in-loop
-            await this.sleep(data.getStatsInterval);
+        } finally {
+            this._statsLoopRunning = false;
         }
     },
 
@@ -587,6 +771,7 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
 
     sendStatus() {
         if (!this.connected) return;
+        if (!this.statusDataChannel || this.statusDataChannel.readyState !== 'open') return;
 
         const { el } = this;
         const { data } = this;
@@ -649,6 +834,14 @@ AFRAME.registerComponent('arena-hybrid-render-client', {
         if (!this.isReady) return;
         this._rafFrameCount += 1;
         const now = performance.now();
+        if (this._rafLastFrameTime > 0) {
+            const frameDeltaMs = now - this._rafLastFrameTime;
+            this._rafFrameDeltaMsSum += frameDeltaMs;
+            this._rafFrameDeltaMsMax = Math.max(this._rafFrameDeltaMsMax, frameDeltaMs);
+            this._rafFrameDeltaCount += 1;
+            if (frameDeltaMs >= 50) this._rafLongFrameCount += 1;
+        }
+        this._rafLastFrameTime = now;
         if (now - this._rafLastSampleTime >= 1000) {
             this._rafFps = (this._rafFrameCount * 1000) / (now - this._rafLastSampleTime);
             this._rafFrameCount = 0;

@@ -10,18 +10,23 @@ export default class WebRTCStatsLogger {
         this._lastPacketsLost = 0;
         this._lastPacketsReceived = 0;
         this._smoothedLoss = 0;
+        this._lastInboundStat = null;
+        this._lastSentStats = null;
+        this._statsCallCount = 0;
+        this._inboundFoundCount = 0;
     }
 
     async getStats(additionalStats) {
         // v10: 增加空检查，防止 PC 被关闭后调用 getStats 抛异常
         if (!this.peerConnection) {
-            return;
+            return false;
         }
         try {
             const report = await this.peerConnection.getStats();
-            this.handleReport(report, additionalStats);
+            return this.handleReport(report, additionalStats);
         } catch (err) {
             console.warn('[WebRTCStatsLogger] getStats failed:', err);
+            return false;
         }
     }
 
@@ -29,13 +34,19 @@ export default class WebRTCStatsLogger {
         const safeAdditionalStats = additionalStats || {};
         // v10: 如果 signaler 已不可用（如重连期间），跳过本次上报
         if (!this.signaler) {
-            return;
+            return false;
         }
+
+        this._statsCallCount++;
+        let sent = false;
 
         report.forEach((stat) => {
             if (stat.type !== 'inbound-rtp') {
                 return;
             }
+
+            this._inboundFoundCount++;
+            this._lastInboundStat = stat;
 
             if (this.logToConsole) {
                 if (stat.codecId !== undefined) {
@@ -153,6 +164,8 @@ export default class WebRTCStatsLogger {
                 const computedStats = {
                     ...stat,
                     statsSchemaVersion: 2,
+                    statsSource: 'webrtc',
+                    statsFallback: false,
                     downlinkKbps: stat.bitrate || 0,
                     packetLossPercent,
                     smoothedLossPercent,
@@ -164,12 +177,16 @@ export default class WebRTCStatsLogger {
                     deltaPacketsReceived,
                 };
 
+                this._lastSentStats = computedStats;
                 this.signaler.sendStats(computedStats);
+                sent = true;
             } else {
                 this._smoothedLoss = 0;
-                this.signaler.sendStats({
+                const initialStats = {
                     ...stat,
                     statsSchemaVersion: 2,
+                    statsSource: 'webrtc',
+                    statsFallback: false,
                     downlinkKbps: stat.bitrate || 0,
                     packetLossPercent: 0,
                     smoothedLossPercent: 0,
@@ -179,10 +196,28 @@ export default class WebRTCStatsLogger {
                     statsIntervalMs: 0,
                     deltaPacketsLost: 0,
                     deltaPacketsReceived: 0,
-                });
+                };
+                this._lastSentStats = initialStats;
+                this.signaler.sendStats(initialStats);
+                sent = true;
             }
         });
 
-        this.lastReport = report;
+        if (!sent) {
+            const types = [];
+            report.forEach((s) => { types.push(s.type); });
+            const uniqueTypes = [...new Set(types)];
+            console.warn(
+                `[WebRTCStatsLogger] #${this._statsCallCount}: NO inbound-rtp in report! ` +
+                `Types present: [${uniqueTypes.join(', ')}]. ` +
+                `Total inbound found so far: ${this._inboundFoundCount}. ` +
+                `Will use fallback if available.`
+            );
+        }
+
+        if (sent) {
+            this.lastReport = report;
+        }
+        return sent;
     }
 }
